@@ -31,7 +31,7 @@ from ._constants import (
     )
 
 from .optim.booster import ConnectionBooster
-from .optim.anderson import Anderson
+from .optim.anderson import Anderson, solve_root
 from .optim.linearization import assemble_statespace
 
 from .utils.graph import Graph
@@ -1213,10 +1213,75 @@ class Simulation:
         return False, total_evals, self.iterations_max
 
 
+    def _solve_steadystate(self, t):
+        """Solve the coupled dynamic residual with the algebraic network inside.
+
+        Unlike the block-local implicit iteration, this includes derivatives
+        through connections, so a feedback loop can determine integrator states.
+        Custom blocks without a derivative retain the block-local solve.
+
+        Parameters
+        ----------
+        t : float
+            evaluation time
+
+        Returns
+        -------
+        success : bool
+            whether the coupled residual is below the simulation tolerance
+        evals : int
+            number of system evaluations
+        iters : int
+            number of root solver iterations
+        """
+        self._update(t)
+        blocks = [b for b in self._blocks_dyn if b]
+
+        #retain the solve protocol of custom blocks without a derivative
+        if any(b.derivative(t) is None for b in blocks):
+            return self._solve(t, self.dt)
+
+        #a purely algebraic diagram only needs the network update
+        if not blocks:
+            return True, 1, 0
+
+        states = [np.atleast_1d(b.state).copy() for b in blocks]
+        split = np.cumsum([s.size for s in states])[:-1]
+        evals = 1
+
+        def residual(x):
+            nonlocal evals
+
+            #use block state accessors so nested subsystems recurse
+            for b, s in zip(blocks, np.split(x, split)):
+                b.state = s
+            self._update(t)
+            evals += 1
+
+            derivatives = []
+            self._solve_tracker.begin_iteration()
+            for b in blocks:
+                d = np.atleast_1d(b.derivative(t))
+                derivatives.append(d)
+                self._solve_tracker.record(b, np.linalg.norm(d, np.inf))
+            return np.concatenate(derivatives)
+
+        x, error, iters = solve_root(
+            Anderson(), residual, np.concatenate(states),
+            tolerance=self.tolerance_fpi, iterations_max=self.iterations_max
+            )
+
+        #finite differences and line searches also change the block states;
+        #leave the states, signals and diagnostics at the returned solution
+        residual(x)
+        self._solve_tracker.iterations = iters
+        return error < self.tolerance_fpi, evals, iters
+
+
     def steadystate(self, reset=False): 
         """Find steady state solution (DC operating point) of the system 
-        by switching all blocks to steady state solver, solving the 
-        fixed point equations, then switching back.
+        by solving the coupled dynamic residual with the algebraic network
+        evaluated at each trial state.
 
         The steady state solver forces all the temporal derivatives, i.e.
         the right hand side equation (including external inputs) of the 
@@ -1260,29 +1325,30 @@ class Simulation:
         #log message begin of steady state solver
         self.logger.info(f"STEADYSTATE -> STARTING (reset: {reset})")
 
-        #solve for steady state at current time
-        with Timer(verbose=False) as T:
-            success, evals, iters = self._solve(self.time, self.dt)
+        try:
+            #solve for steady state at current time
+            with Timer(verbose=False) as T:
+                success, evals, iters = self._solve_steadystate(self.time)
 
-        #catch non convergence
-        if not success:
-            details = self._solve_tracker.details(lambda b: b.__class__.__name__)
-            _msg = "STEADYSTATE -> FAILED (evals: {}, iters: {}, runtime: {})\n{}".format(
-                evals, iters, T, "\n".join(details))
-            self.logger.error(_msg)
-            raise RuntimeError(_msg)
+            #catch non convergence
+            if not success:
+                details = self._solve_tracker.details(lambda b: b.__class__.__name__)
+                _msg = "STEADYSTATE -> FAILED (evals: {}, iters: {}, runtime: {})\n{}".format(
+                    evals, iters, T, "\n".join(details))
+                self.logger.error(_msg)
+                raise RuntimeError(_msg)
 
-        #sample result
-        self._sample(self.time, self.dt)
+            #sample result
+            self._sample(self.time, self.dt)
 
-        #log message
-        self.logger.info(
-            "STEADYSTATE -> FINISHED (success: {}, evals: {}, iters: {}, runtime: {})".format(
-                success, evals, iters, T)
-            )
-
-        #switch back to original solver
-        self._set_solver(_solver)
+            #log message
+            self.logger.info(
+                "STEADYSTATE -> FINISHED (success: {}, evals: {}, iters: {}, runtime: {})".format(
+                    success, evals, iters, T)
+                )
+        finally:
+            #restore the transient solver on convergence failure or exceptions
+            self._set_solver(_solver)
 
 
     # initial timestep estimation -------------------------------------------------

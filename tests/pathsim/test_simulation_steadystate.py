@@ -104,6 +104,20 @@ class TestCoupledSteadyState(unittest.TestCase):
         np.testing.assert_allclose(plant.state, [1.], atol=1e-9)
         np.testing.assert_array_equal(inactive.state, [7.])
 
+    def test_inactive_nested_state_is_unchanged(self):
+        for depth in [1, 2]:
+            with self.subTest(depth=depth):
+                sim, _, plant, _ = self.closed_loop(nested=True)
+                inactive = ODE(lambda x, u, t: 2-x, initial_value=7.)
+                wrapped = inactive
+                for _ in range(depth):
+                    wrapped = Subsystem([Interface(), wrapped], [])
+                sim.add_block(wrapped)
+                inactive.off()
+                sim.steadystate()
+                np.testing.assert_allclose(plant.state, [1.], atol=1e-9)
+                np.testing.assert_array_equal(inactive.state, [7.])
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

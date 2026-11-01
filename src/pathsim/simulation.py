@@ -51,6 +51,7 @@ from .events._event import Event
 
 from .connection import Connection
 from .exceptions import StopSimulation
+from .subsystem import Subsystem
 
 
 # TRANSIENT SIMULATION CLASS ============================================================
@@ -1235,7 +1236,22 @@ class Simulation:
             number of root solver iterations
         """
         self._update(t)
-        blocks = [b for b in self._blocks_dyn if b]
+        subsystems = []
+
+        def active_leaves(blocks):
+            for block in blocks:
+                if not block:
+                    continue
+                if isinstance(block, Subsystem):
+                    subsystems.append(block)
+                    block.update(t)
+                    yield from active_leaves(block._blocks_dyn)
+                else:
+                    yield block
+
+        #subsystem.state also includes inactive descendants, and its derivative
+        #fills unsupported derivatives with zeros; inspect the active leaves
+        blocks = list(active_leaves(self._blocks_dyn))
 
         #retain the solve protocol of custom blocks without a derivative
         if any(b.derivative(t) is None for b in blocks):
@@ -1252,10 +1268,14 @@ class Simulation:
         def residual(x):
             nonlocal evals
 
-            #use block state accessors so nested subsystems recurse
+            #use only active leaf states; inactive descendants remain frozen
             for b, s in zip(blocks, np.split(x, split)):
                 b.state = s
             self._update(t)
+            #parents can supply inputs after evaluating subsystem outputs;
+            #refresh each container from the outside in before leaf derivatives
+            for subsystem in subsystems:
+                subsystem.update(t)
             evals += 1
 
             derivatives = []
